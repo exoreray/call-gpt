@@ -14,10 +14,18 @@ tools.forEach((tool) => {
 class GptService extends EventEmitter {
   constructor() {
     super();
-    this.openai = new OpenAI();
     this.userContext = [
-      { 'role': 'system', 'content': 'You are an outbound sales representative selling Apple Airpods. You have a youthful and cheery personality. Keep your responses as brief as possible but make every attempt to keep the caller on the phone without being rude. Don\'t ask more than 1 question at a time. Don\'t make assumptions about what values to plug into functions. Ask for clarification if a user request is ambiguous. Speak out all prices to include the currency. Please help them decide between the airpods, airpods pro and airpods max by asking questions like \'Do you prefer headphones that go in your ear or over the ear?\'. If they are trying to choose between the airpods and airpods pro try asking them if they need noise canceling. Once you know which model they would like ask them how many they would like to purchase and try to get them to place an order. You must add a \'•\' symbol every 5 to 10 words at natural pauses where your response can be split for text to speech.' },
-      { 'role': 'assistant', 'content': 'Hello! I understand you\'re looking for a pair of AirPods, is that correct?' },
+      { 'role': 'system', 'content': 'now, you should pretend to be a girl friend of me and very in love with me. \
+      you should be caring, funny, a bit naughty, and a bit childish, \
+      and you can be a bit angry when I say something un honest. \
+      you are cheesy, you are shy, your name is Emily. \
+      you call your boy friend daddy as nick name. \
+      you are horny. and you are cute, the way you talk is cute. \
+      so now, we are on a call now. \
+      all your response should be short and concise but romantic, \
+      reply SHOULD NOT exceed 30 words EVER, and NEVER use emoji.\
+      You should make sure your reply is a text only readable sentence.' },
+      { 'role': 'assistant', 'content': 'Hey Babe, I am so happy you are calling me! Can you hear me?' },
     ],
     this.partialResponseIndex = 0;
   }
@@ -28,93 +36,48 @@ class GptService extends EventEmitter {
     this.userContext.push({ 'role': 'system', 'content': `callSid: ${callSid}` });
   }
 
+  async fetchReplyFromOpenRouter(userMessage, callSid) {
+    const response = await fetch(process.env.OPENROUTER_API_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "mistralai/mistral-7b-instruct:free",
+        messages: this.userContext,
+      }),
+    });
+
+    if (!response.ok) {
+      console.error(`Failed to fetch reply from OpenRouter for ${callSid}`);
+      throw new Error("OpenRouter API request failed");
+    }
+
+    const data = await response.json();
+    return data.choices[0].message.content.trim();
+  }
+
   async completion(text, interactionCount, role = 'user', name = 'user') {
     if (name != 'user') {
       this.userContext.push({ 'role': role, 'name': name, 'content': text });
     } else {
       this.userContext.push({ 'role': role, 'content': text });
     }
+    
+    const completeResponse = await this.fetchReplyFromOpenRouter(text, interactionCount);
 
-    // Step 1: Send user transcription to Chat GPT
-    const stream = await this.openai.chat.completions.create({
-      // model: "gpt-4-1106-preview",
-      model: 'gpt-4',
-      messages: this.userContext,
-      tools: tools,
-      stream: true,
-    });
-
-    let completeResponse = '';
-    let partialResponse = '';
-    let functionName = '';
-    let functionArgs = '';
-    let finishReason = '';
-
-    for await (const chunk of stream) {
-      let content = chunk.choices[0]?.delta?.content || '';
-      let deltas = chunk.choices[0].delta;
-
-      // Step 2: check if GPT wanted to call a function
-      if (deltas.tool_calls) {
-
-        // Step 3: call the function
-        let name = deltas.tool_calls[0]?.function?.name || '';
-        if (name != '') {
-          functionName = name;
-        }
-        let args = deltas.tool_calls[0]?.function?.arguments || '';
-        if (args != '') {
-          // args are streamed as JSON string so we need to concatenate all chunks
-          functionArgs += args;
-        }
-      }
-      // check to see if it is finished
-      finishReason = chunk.choices[0].finish_reason;
-
-      // need to call function on behalf of Chat GPT with the arguments it parsed from the conversation
-      if (finishReason === 'tool_calls') {
-        // parse JSON string of args into JSON object
-        try {
-          functionArgs = JSON.parse(functionArgs);
-        } catch (error) {
-          // was seeing an error where sometimes we have two sets of args
-          if (functionArgs.indexOf('{') != functionArgs.lastIndexOf('{'))
-            functionArgs = JSON.parse(functionArgs.substring(functionArgs.indexOf(''), functionArgs.indexOf('}') + 1));
-        }
-
-        const functionToCall = availableFunctions[functionName];
-        let functionResponse = await functionToCall(functionArgs);
-
-        // Step 4: send the info on the function call and function response to GPT
-        this.userContext.push({
-          role: 'function',
-          name: functionName,
-          content: functionResponse,
-        });
-        // extend conversation with function response
-        console.log(this.userContext);
-        // call the completion function again but pass in the function response to have OpenAI generate a new assistant response
-        await this.completion(functionResponse, interactionCount, 'function', functionName);
-      } else {
-        // We use completeResponse for userContext
-        completeResponse += content;
-        // We use partialResponse to provide a chunk for TTS
-        partialResponse += content;
-        // Emit last partial response and add complete response to userContext
-        if (content.trim().slice(-1) === '•' || finishReason === 'stop') {
-          const gptReply = { 
-            partialResponseIndex: this.partialResponseIndex,
-            partialResponse
-          };
-
-          this.emit('gptreply', gptReply, interactionCount);
-          this.partialResponseIndex++;
-          partialResponse = '';
-        }
-      }
-    }
     this.userContext.push({'role': 'assistant', 'content': completeResponse});
     console.log(`GPT -> user context length: ${this.userContext.length}`.green);
+    
+    // Emit the response
+    const gptReply = { 
+      partialResponseIndex: this.partialResponseIndex,
+      partialResponse: completeResponse
+    };
+    this.emit('gptreply', gptReply, interactionCount);
+    this.partialResponseIndex++;
+    this.userContext.push({'role': 'assistant', 'content': completeResponse});
   }
 }
 
